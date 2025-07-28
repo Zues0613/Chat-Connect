@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+prisma
+pydantic
+python-jose[cryptography]
+passlib[bcrypt]
+python-multipart
+python-dotenv
+openai
+aiohttp
+websockets
+pydantic-settings 
