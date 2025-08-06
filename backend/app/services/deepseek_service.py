@@ -155,28 +155,59 @@ class DeepSeekService:
             print(f"[ERROR] Failed to send streaming message: {e}")
             raise Exception(f"Failed to get streaming response: {e}")
 
-    def send_function_result(self, function_name: str, function_result: Any) -> Dict[str, Any]:
-        """Send function result back to the model"""
+    async def send_tool_results(self, tool_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Send tool results back to the model"""
         try:
             if not self.client:
                 raise Exception("Client not initialized")
 
-            # Add function result to conversation
+            # Add tool results to conversation
+            for tool_result in tool_results:
+                self.conversation_history.append({
+                    'role': 'tool',
+                    'tool_call_id': tool_result['tool_call_id'],
+                    'content': json.dumps(tool_result['result'])
+                })
+
+            # Send another request to get the final response
+            response = await self.client.chat.completions.create(
+                model='deepseek/deepseek-r1-0528',
+                messages=self.conversation_history,
+                max_tokens=4000,
+                temperature=0.7,
+                extra_headers={
+                    'HTTP-Referer': 'http://localhost:3000',
+                    'X-Title': 'VeeChat AI Assistant',
+                }
+            )
+
+            assistant_message = response.choices[0].message
+            
+            # Add assistant response to history
             self.conversation_history.append({
-                'role': 'function',
-                'name': function_name,
-                'content': json.dumps(function_result)
+                'role': 'assistant',
+                'content': assistant_message.content or ''
             })
 
             return {
-                'type': 'function_result',
-                'function_name': function_name,
-                'result': function_result
+                'content': assistant_message.content,
+                'type': 'text'
             }
 
         except Exception as e:
-            print(f"[ERROR] Failed to send function result: {e}")
-            raise Exception(f"Failed to send function result: {e}")
+            print(f"[ERROR] Failed to send tool results: {e}")
+            return {
+                'error': f"Failed to process tool results: {e}",
+                'type': 'error'
+            }
+
+    async def send_function_result(self, function_name: str, function_result: Any) -> Dict[str, Any]:
+        """Send function result back to the model (legacy method)"""
+        return await self.send_tool_results([{
+            "tool_call_id": "call_1",
+            "name": function_name,
+            "result": function_result
+        }])
 
     def get_chat_history(self) -> List[Dict[str, str]]:
         """Get current conversation history"""

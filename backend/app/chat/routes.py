@@ -10,6 +10,7 @@ import asyncio
 from app.auth.jwt_handler import decode_access_token
 from app.services.deepseek_service import deepseek_service
 from app.services.mcp_service import mcp_service
+from app.services.mcp_service_deepseek import mcp_service_deepseek
 
 router = APIRouter()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
@@ -29,6 +30,7 @@ class ChatResponse(BaseModel):
     title: str
     createdAt: str
     updatedAt: str
+    hash: str
 
 class MessageResponse(BaseModel):
     id: int
@@ -57,11 +59,15 @@ async def create_chat(
             await prisma.disconnect()
             raise HTTPException(status_code=404, detail="User not found.")
         
-        # Create new chat session
+        # Create new chat session with hash
+        import uuid
+        chat_hash = f"chat_{uuid.uuid4().hex[:16]}"
+        
         chat = await prisma.chatsession.create(
             data={
                 "userId": user.id,
-                "title": request.title or "New Chat"
+                "title": request.title or "New Chat",
+                "hash": chat_hash
             }
         )
         
@@ -71,7 +77,8 @@ async def create_chat(
             id=chat.id,
             title=chat.title or "New Chat",
             createdAt=chat.createdAt.isoformat(),
-            updatedAt=chat.updatedAt.isoformat()
+            updatedAt=chat.updatedAt.isoformat(),
+            hash=chat.hash
         )
         
     except Exception as e:
@@ -234,7 +241,8 @@ async def list_chats(token: str = Depends(oauth2_scheme)):
                 id=chat.id,
                 title=chat.title or "New Chat",
                 createdAt=chat.createdAt.isoformat(),
-                updatedAt=chat.updatedAt.isoformat()
+                updatedAt=chat.updatedAt.isoformat(),
+                hash=chat.hash or f"chat_{chat.id}"
             )
             for chat in chats
         ]
@@ -249,7 +257,10 @@ async def get_chat_messages(
     token: str = Depends(oauth2_scheme)
 ):
     """Get all messages for a specific chat"""
+    prisma = None
     try:
+        print(f"[DEBUG] Getting messages for chat {chat_id}")
+        
         payload = decode_access_token(token)
         email = payload.get("sub")
         if not email:
@@ -257,6 +268,7 @@ async def get_chat_messages(
         
         prisma = Prisma()
         await prisma.connect()
+        print(f"[DEBUG] Connected to database")
         
         # Get user
         user = await prisma.user.find_unique(where={"email": email})
@@ -264,22 +276,31 @@ async def get_chat_messages(
             await prisma.disconnect()
             raise HTTPException(status_code=404, detail="User not found.")
         
-        # Verify chat belongs to user
+        print(f"[DEBUG] Found user: {user.email}")
+        
+        # Verify chat belongs to user and get messages
         chat = await prisma.chatsession.find_unique(
             where={"id": chat_id},
             include={"messages": True}
         )
         
-        if not chat or chat.userId != user.id:
+        if not chat:
             await prisma.disconnect()
             raise HTTPException(status_code=404, detail="Chat not found.")
+        
+        if chat.userId != user.id:
+            await prisma.disconnect()
+            raise HTTPException(status_code=403, detail="Access denied.")
+        
+        print(f"[DEBUG] Found chat with {len(chat.messages)} messages")
         
         # Sort messages by createdAt in ascending order
         sorted_messages = sorted(chat.messages, key=lambda x: x.createdAt)
         
         await prisma.disconnect()
+        print(f"[DEBUG] Disconnected from database")
         
-        return [
+        result = [
             MessageResponse(
                 id=msg.id,
                 content=msg.content,
@@ -289,8 +310,149 @@ async def get_chat_messages(
             for msg in sorted_messages
         ]
         
+        print(f"[DEBUG] Returning {len(result)} messages")
+        return result
+        
     except Exception as e:
-        print(f"[ERROR] Failed to get messages: {e}")
+        print(f"[ERROR] Failed to get messages for chat {chat_id}: {e}")
+        if prisma:
+            try:
+                await prisma.disconnect()
+            except:
+                pass
+        raise HTTPException(status_code=500, detail=f"Failed to get messages: {e}")
+
+@router.get("/chats/hash/{chat_hash}")
+async def get_chat_by_hash(
+    chat_hash: str,
+    token: str = Depends(oauth2_scheme)
+):
+    """Get chat by hash"""
+    prisma = None
+    try:
+        print(f"[DEBUG] Getting chat by hash: {chat_hash}")
+        
+        payload = decode_access_token(token)
+        email = payload.get("sub")
+        if not email:
+            raise HTTPException(status_code=401, detail="Invalid token.")
+        
+        prisma = Prisma()
+        await prisma.connect()
+        print(f"[DEBUG] Connected to database")
+        
+        # Get user
+        user = await prisma.user.find_unique(where={"email": email})
+        if not user:
+            await prisma.disconnect()
+            raise HTTPException(status_code=404, detail="User not found.")
+        
+        print(f"[DEBUG] Found user: {user.email}")
+        
+        # Find chat by hash
+        chat = await prisma.chatsession.find_unique(
+            where={"hash": chat_hash}
+        )
+        
+        if not chat:
+            await prisma.disconnect()
+            raise HTTPException(status_code=404, detail="Chat not found.")
+        
+        if chat.userId != user.id:
+            await prisma.disconnect()
+            raise HTTPException(status_code=403, detail="Access denied.")
+        
+        print(f"[DEBUG] Found chat: {chat.id} ({chat.title})")
+        
+        await prisma.disconnect()
+        print(f"[DEBUG] Disconnected from database")
+        
+        return ChatResponse(
+            id=chat.id,
+            title=chat.title or "New Chat",
+            createdAt=chat.createdAt.isoformat(),
+            updatedAt=chat.updatedAt.isoformat(),
+            hash=chat.hash
+        )
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to get chat by hash {chat_hash}: {e}")
+        if prisma:
+            try:
+                await prisma.disconnect()
+            except:
+                pass
+        raise HTTPException(status_code=500, detail=f"Failed to get chat: {e}")
+
+@router.get("/chats/hash/{chat_hash}/messages")
+async def get_chat_messages_by_hash(
+    chat_hash: str,
+    token: str = Depends(oauth2_scheme)
+):
+    """Get messages for a chat by hash"""
+    prisma = None
+    try:
+        print(f"[DEBUG] Getting messages for chat hash: {chat_hash}")
+        
+        payload = decode_access_token(token)
+        email = payload.get("sub")
+        if not email:
+            raise HTTPException(status_code=401, detail="Invalid token.")
+        
+        prisma = Prisma()
+        await prisma.connect()
+        print(f"[DEBUG] Connected to database")
+        
+        # Get user
+        user = await prisma.user.find_unique(where={"email": email})
+        if not user:
+            await prisma.disconnect()
+            raise HTTPException(status_code=404, detail="User not found.")
+        
+        print(f"[DEBUG] Found user: {user.email}")
+        
+        # Find chat by hash and verify ownership
+        chat = await prisma.chatsession.find_unique(
+            where={"hash": chat_hash},
+            include={"messages": True}
+        )
+        
+        if not chat:
+            await prisma.disconnect()
+            raise HTTPException(status_code=404, detail="Chat not found.")
+        
+        if chat.userId != user.id:
+            await prisma.disconnect()
+            raise HTTPException(status_code=403, detail="Access denied.")
+        
+        print(f"[DEBUG] Found chat with {len(chat.messages)} messages")
+        
+        # Sort messages by createdAt in ascending order
+        sorted_messages = sorted(chat.messages, key=lambda x: x.createdAt)
+        
+        await prisma.disconnect()
+        print(f"[DEBUG] Disconnected from database")
+        
+        result = [
+            MessageResponse(
+                id=msg.id,
+                content=msg.content,
+                role=msg.role,
+                createdAt=msg.createdAt.isoformat()
+            )
+            for msg in sorted_messages
+        ]
+        
+        print(f"[DEBUG] Returning {len(result)} messages")
+        return result
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to get messages for chat hash {chat_hash}: {e}")
+        if prisma:
+            try:
+                await prisma.disconnect()
+            except:
+                pass
         raise HTTPException(status_code=500, detail=f"Failed to get messages: {e}")
 
 async def get_user_deepseek_api_key(email: str) -> Optional[str]:
@@ -345,7 +507,32 @@ async def initialize_mcp_servers(user_id: int) -> None:
         # Connect to each server
         for server in servers:
             server_id = f"user_{user_id}_server_{server.id}"
-            await mcp_service.connect_to_server(server_id, server.config)
+            
+            # Parse config from JSON string to dictionary
+            try:
+                if isinstance(server.config, str):
+                    config = json.loads(server.config)
+                else:
+                    config = server.config
+                
+                # Add server name to config for better error messages
+                config['name'] = server.name
+                
+                print(f"[DEBUG] Connecting to MCP server: {server.name}")
+                print(f"[DEBUG] Config: {json.dumps(config, indent=2)}")
+                
+                success = await mcp_service.connect_to_server(server_id, config)
+                
+                if success:
+                    print(f"[DEBUG] Successfully connected to MCP server: {server.name}")
+                else:
+                    print(f"[DEBUG] Failed to connect to MCP server: {server.name}")
+                    
+            except json.JSONDecodeError as e:
+                print(f"[ERROR] Failed to parse config for server {server.name}: {e}")
+                print(f"[ERROR] Raw config: {server.config}")
+            except Exception as e:
+                print(f"[ERROR] Failed to connect to server {server.name}: {e}")
         
     except Exception as e:
         print(f"[ERROR] Failed to initialize MCP servers: {e}")
@@ -412,7 +599,7 @@ async def send_message(
             await prisma.disconnect()
             raise HTTPException(status_code=400, detail="Failed to initialize DeepSeek API.")
         
-        # Prepare chat history for Gemini
+        # Prepare chat history
         history = []
         # Sort messages by createdAt in ascending order
         sorted_messages = sorted(chat.messages, key=lambda x: x.createdAt)
@@ -422,42 +609,78 @@ async def send_message(
                 "content": msg.content
             })
         
-        # Add the new user message to history
-        history.append({
-            "role": "user",
-            "content": request.content
-        })
-        
         # Start chat session with history
-        if not deepseek_service.start_chat_session(history[:-1]):  # Exclude the last message as we'll send it
+        if not deepseek_service.start_chat_session(history):
             await prisma.disconnect()
             raise HTTPException(status_code=500, detail="Failed to start chat session.")
         
-        # Initialize MCP servers for this user
+        # Initialize MCP servers and get tools for DeepSeek
+        print(f"[DEBUG] Initializing MCP servers for user {user.id}")
         await initialize_mcp_servers(user.id)
         
-        # Get available tools from MCP servers
-        available_tools = mcp_service.get_all_tools()
+        # Get MCP tools in OpenAI format for DeepSeek
+        mcp_tools = mcp_service.get_openai_tools()
+        print(f"[DEBUG] Available MCP tools for DeepSeek: {len(mcp_tools)} tools")
         
-        # Send message to DeepSeek
-        response = await deepseek_service.send_message(request.content, available_tools)
+        if mcp_tools:
+            print(f"[DEBUG] Tool names: {[tool['function']['name'] for tool in mcp_tools]}")
         
-        # Handle different response types
-        if response.get("type") == "function_call":
-            # DeepSeek wants to call a tool
-            tool_name = response["function_name"]
-            tool_args = response["function_args"]
+        # Send message to DeepSeek with MCP tools
+        response = await deepseek_service.send_message(request.content, tools=mcp_tools if mcp_tools else None)
+        
+        # Handle tool calls if DeepSeek wants to use tools
+        if response.get("type") == "tool_calls":
+            print(f"[DEBUG] DeepSeek requested tool calls: {response.get('tool_calls')}")
             
-            # Call the MCP tool
-            tool_result = await mcp_service.call_tool(tool_name, tool_args)
+            tool_results = []
+            for tool_call in response.get("tool_calls", []):
+                try:
+                    # Extract tool call information
+                    function_name = tool_call.function.name
+                    function_args = json.loads(tool_call.function.arguments)
+                    tool_call_id = tool_call.id
+                    
+                    print(f"[DEBUG] Calling tool: {function_name} with args: {function_args}")
+                    
+                    # Use enhanced MCP service with health checks and fallbacks
+                    tool_result = await mcp_service_deepseek.execute_tool_with_health_check(tool_call)
+                    
+                    # Check if tool call failed and generate user-friendly message
+                    if not tool_result.get("success", False):
+                        error_msg = tool_result.get("error", "Unknown error")
+                        suggestion = tool_result.get("suggestion", "Please try again")
+                        user_friendly_error = f"❌ {error_msg}\n\n💡 {suggestion}"
+                        print(f"[DEBUG] Tool call failed: {user_friendly_error}")
+                        tool_result["user_friendly_error"] = user_friendly_error
+                    
+                    tool_results.append({
+                        "tool_call_id": tool_call_id,
+                        "result": tool_result
+                    })
+                    
+                    print(f"[DEBUG] Tool result: {tool_result}")
+                    
+                except Exception as e:
+                    print(f"[ERROR] Failed to call tool {function_name}: {e}")
+                    error_result = {"error": f"Tool call failed: {str(e)}"}
+                    user_friendly_error = f"❌ Tool execution failed: {str(e)}\n\n💡 Please check your configuration and try again."
+                    tool_results.append({
+                        "tool_call_id": tool_call.id,
+                        "result": {
+                            "error": f"Tool call failed: {str(e)}",
+                            "user_friendly_error": user_friendly_error
+                        }
+                    })
             
-            # Send tool result back to DeepSeek
-            final_response = deepseek_service.send_function_result(tool_name, tool_result)
-            assistant_content = final_response.get("content", "Tool executed successfully.")
-            
-        elif response.get("error"):
-            assistant_content = f"I encountered an error: {response['error']}"
+            # Send tool results back to DeepSeek
+            if tool_results:
+                print(f"[DEBUG] Sending tool results back to DeepSeek")
+                response = await deepseek_service.send_tool_results(tool_results)
+                assistant_content = response.get("content", "I'm sorry, I couldn't process the tool results.")
+            else:
+                assistant_content = "I'm sorry, I couldn't execute the requested tools."
         else:
+            # Regular text response
             assistant_content = response.get("content", "I'm sorry, I couldn't generate a response.")
         
         # Store assistant message
@@ -534,47 +757,49 @@ async def send_message_stream(
             
             yield f"data: {json.dumps({'type': 'user_message', 'message': {'id': user_message.id, 'content': user_message.content, 'role': 'user'}})}\n\n"
             
-            # Get Gemini API key and initialize
-            gemini_api_key = await get_user_gemini_api_key(email)
-            if not gemini_api_key:
-                yield f"data: {json.dumps({'error': 'No Gemini API key available. Please contact administrator or add your own API key in settings.'})}\n\n"
+            # Get DeepSeek API key and initialize
+            deepseek_api_key = await get_user_deepseek_api_key(email)
+            if not deepseek_api_key:
+                yield f"data: {json.dumps({'error': 'No DeepSeek API key available. Please contact administrator or add your own API key in settings.'})}\n\n"
                 return
             
-            if not gemini_service.initialize_with_api_key(gemini_api_key):
-                yield f"data: {json.dumps({'error': 'Failed to initialize Gemini'})}\n\n"
+            if not deepseek_service.initialize_with_api_key(deepseek_api_key):
+                yield f"data: {json.dumps({'error': 'Failed to initialize DeepSeek'})}\n\n"
                 return
             
             # Prepare history and start session
             history = [{"role": msg.role, "content": msg.content} for msg in chat.messages]
-            history.append({"role": "user", "content": request.content})
             
-            if not gemini_service.start_chat_session(history[:-1]):
+            if not deepseek_service.start_chat_session(history):
                 yield f"data: {json.dumps({'error': 'Failed to start chat session'})}\n\n"
                 return
             
-            # Initialize MCP and get tools
+            # Initialize MCP servers and get tools for DeepSeek
+            print(f"[DEBUG] Initializing MCP servers for user {user.id}")
             await initialize_mcp_servers(user.id)
-            available_tools = mcp_service.get_all_tools()
             
-            # Stream response from Gemini
+            # Get MCP tools in OpenAI format for DeepSeek
+            mcp_tools = mcp_service.get_openai_tools()
+            print(f"[DEBUG] Available MCP tools for DeepSeek streaming: {len(mcp_tools)} tools")
+            
+            if mcp_tools:
+                print(f"[DEBUG] Tool names: {[tool['function']['name'] for tool in mcp_tools]}")
+            
+            # Stream response from DeepSeek with MCP tools
             full_response = ""
-            async for chunk in gemini_service.send_message_stream(request.content, available_tools):
-                chunk_data = json.loads(chunk)
-                if chunk_data.get("type") == "text_chunk":
-                    full_response += chunk_data["content"]
-                    yield f"data: {chunk}\n\n"
-                elif chunk_data.get("type") == "complete":
-                    # Store the complete assistant message
-                    assistant_message = await prisma.message.create(
-                        data={
-                            "chatSessionId": chat_id,
-                            "content": full_response,
-                            "role": "assistant"
-                        }
-                    )
-                    yield f"data: {json.dumps({'type': 'complete', 'message_id': assistant_message.id})}\n\n"
-                else:
-                    yield f"data: {chunk}\n\n"
+            async for chunk in deepseek_service.send_message_stream(request.content, tools=mcp_tools if mcp_tools else None):
+                full_response += chunk
+                yield f"data: {json.dumps({'type': 'text_chunk', 'content': chunk})}\n\n"
+            
+            # Store the complete assistant message
+            assistant_message = await prisma.message.create(
+                data={
+                    "chatSessionId": chat_id,
+                    "content": full_response,
+                    "role": "assistant"
+                }
+            )
+            yield f"data: {json.dumps({'type': 'complete', 'message_id': assistant_message.id})}\n\n"
             
             await prisma.disconnect()
             

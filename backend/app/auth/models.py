@@ -21,7 +21,7 @@ class MeResponse(BaseModel):
 class MCPServerRequest(BaseModel):
     name: str
     description: Optional[str] = None
-    config: Dict[str, Any]
+    config: Optional[Dict[str, Any]] = None
 
 class MCPServerResponse(BaseModel):
     id: int
@@ -34,3 +34,21 @@ class MCPServerUpdateRequest(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
     config: Optional[Dict[str, Any]] = None
+
+# API Key Management Models
+class APIKeyRequest(BaseModel):
+    name: str
+    provider: str
+    value: str
+
+class APIKeyResponse(BaseModel):
+    id: int
+    name: str
+    provider: str
+    value: str  # This will be masked in the response
+    createdAt: str
+
+class APIKeyUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    provider: Optional[str] = None
+    value: Optional[str] = None
