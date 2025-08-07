@@ -1,6 +1,25 @@
 # ChatConnect Backend Server
 
-This is the backend server for ChatConnect, an AI-powered MCP integration platform.
+This is the backend server for ChatConnect, a **dual-purpose AI chat platform**:
+
+## 🎯 **Dual Functionality**
+
+### **1. General AI Chat (Primary)**
+- **Like ChatGPT**: Regular conversations, coding help, writing, analysis
+- **Fast & Reliable**: Optimized for quick responses
+- **No Dependencies**: Works without any external tools
+
+### **2. MCP Server Integration (Optional)**
+- **Enhanced Capabilities**: Access to specialized tools when needed
+- **Non-Blocking**: MCP servers are optional and don't slow down regular chat
+- **Configurable**: Can be completely disabled via environment variable
+
+## 🚀 **Use Cases**
+
+- **General Chat**: "Help me write a Python function"
+- **Coding**: "Debug this JavaScript code"
+- **Analysis**: "Explain this concept"
+- **MCP Enhanced**: "Send an email using Gmail" (when MCP servers are configured)
 
 ## Quick Start
 
@@ -66,6 +85,9 @@ FRONTEND_URL="http://localhost:3000"
 
 # CORS
 CORS_ORIGINS="http://localhost:3000,http://127.0.0.1:3000"
+
+# MCP Servers (Optional)
+ENABLE_MCP_SERVERS="true"  # Set to "false" to disable MCP servers completely
 ```
 
 ## Troubleshooting

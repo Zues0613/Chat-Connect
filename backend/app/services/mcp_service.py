@@ -258,36 +258,105 @@ class MCPClient:
                 # Handle HTTP-based MCP servers (like Pipedream)
                 try:
                     async with aiohttp.ClientSession() as session:
-                        # Try POST request to the MCP server
+                        # Try POST request to the MCP server with proper headers
+                        headers = {
+                            "Content-Type": "application/json",
+                            "Accept": "application/json, text/event-stream"
+                        }
+                        
                         async with session.post(
                             self.uri,
                             json=tools_request,
-                            headers={"Content-Type": "application/json"}
+                            headers=headers
                         ) as response:
                             if response.status == 200:
-                                response_data = await response.json()
-                                if "result" in response_data and "tools" in response_data["result"]:
-                                    self.available_tools = response_data["result"]["tools"]
-                                    logger.info(f"Discovered {len(self.available_tools)} tools via HTTP")
-                                    return
+                                content_type = response.headers.get('content-type', '')
+                                
+                                # Handle Server-Sent Events (text/event-stream)
+                                if 'text/event-stream' in content_type:
+                                    logger.info("Detected Server-Sent Events response, parsing SSE stream")
+                                    try:
+                                        # Read the SSE stream and extract JSON data
+                                        async for line in response.content:
+                                            line = line.decode('utf-8').strip()
+                                            if line.startswith('data: '):
+                                                data = line[6:]  # Remove 'data: ' prefix
+                                                if data and data != '[DONE]':
+                                                    try:
+                                                        response_data = json.loads(data)
+                                                        if "result" in response_data and "tools" in response_data["result"]:
+                                                            self.available_tools = response_data["result"]["tools"]
+                                                            logger.info(f"Discovered {len(self.available_tools)} tools via SSE")
+                                                            return
+                                                    except json.JSONDecodeError:
+                                                        continue
+                                    except Exception as e:
+                                        logger.error(f"Failed to parse SSE stream: {e}")
+                                
+                                # Handle regular JSON response
+                                else:
+                                    try:
+                                        response_data = await response.json()
+                                        if "result" in response_data and "tools" in response_data["result"]:
+                                            self.available_tools = response_data["result"]["tools"]
+                                            logger.info(f"Discovered {len(self.available_tools)} tools via HTTP JSON")
+                                            return
+                                    except Exception as e:
+                                        logger.error(f"Failed to parse JSON response: {e}")
+                                        
+                            elif response.status == 406:
+                                logger.info("Server requires both JSON and SSE support, trying alternative approach")
+                                # Try with different headers or approach
+                                pass
                         
                         # If POST fails, try GET request to /tools endpoint
                         try:
                             tools_url = self.uri.rstrip('/') + '/tools'
-                            async with session.get(tools_url) as response:
+                            async with session.get(tools_url, headers=headers) as response:
                                 if response.status == 200:
-                                    response_data = await response.json()
-                                    if "tools" in response_data:
-                                        self.available_tools = response_data["tools"]
-                                        logger.info(f"Discovered {len(self.available_tools)} tools via GET /tools")
-                                        return
-                        except:
+                                    content_type = response.headers.get('content-type', '')
+                                    
+                                    # Handle Server-Sent Events (text/event-stream)
+                                    if 'text/event-stream' in content_type:
+                                        logger.info("Detected Server-Sent Events response in GET request, parsing SSE stream")
+                                        try:
+                                            # Read the SSE stream and extract JSON data
+                                            async for line in response.content:
+                                                line = line.decode('utf-8').strip()
+                                                if line.startswith('data: '):
+                                                    data = line[6:]  # Remove 'data: ' prefix
+                                                    if data and data != '[DONE]':
+                                                        try:
+                                                            response_data = json.loads(data)
+                                                            if "tools" in response_data:
+                                                                self.available_tools = response_data["tools"]
+                                                                logger.info(f"Discovered {len(self.available_tools)} tools via GET /tools SSE")
+                                                                return
+                                                        except json.JSONDecodeError:
+                                                            continue
+                                        except Exception as e:
+                                            logger.error(f"Failed to parse SSE stream in GET request: {e}")
+                                    
+                                    # Handle regular JSON response
+                                    else:
+                                        try:
+                                            response_data = await response.json()
+                                            if "tools" in response_data:
+                                                self.available_tools = response_data["tools"]
+                                                logger.info(f"Discovered {len(self.available_tools)} tools via GET /tools JSON")
+                                                return
+                                        except Exception as e:
+                                            logger.error(f"Failed to parse JSON response in GET request: {e}")
+                        except Exception as e:
+                            logger.error(f"GET /tools request failed: {e}")
                             pass
                         
                         # For Pipedream MCP servers, we might need to hardcode some known tools
-                        if "pipedream.net" in self.uri and "gmail" in self.uri:
-                            logger.info("Using hardcoded Gmail tools for Pipedream MCP server")
-                            self.available_tools = [
+                        if "pipedream.net" in self.uri:
+                            logger.info("Using hardcoded tools for Pipedream MCP server")
+                            
+                            # Base tools for any Pipedream MCP server
+                            base_tools = [
                                 {
                                     "name": "mcp_Gmail_gmail-send-email",
                                     "description": "Send an email from your Google Workspace email account",
@@ -329,9 +398,88 @@ class MCPClient:
                                         },
                                         "required": ["instruction"]
                                     }
+                                },
+                                {
+                                    "name": "mcp_Gmail_gmail-create-draft",
+                                    "description": "Create a draft from your Google Workspace email account",
+                                    "inputSchema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "instruction": {
+                                                "type": "string",
+                                                "description": "Very detailed instructions describing the action to be taken"
+                                            }
+                                        },
+                                        "required": ["instruction"]
+                                    }
+                                },
+                                {
+                                    "name": "mcp_Gmail_gmail-add-label-to-email",
+                                    "description": "Add label(s) to an email message",
+                                    "inputSchema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "instruction": {
+                                                "type": "string",
+                                                "description": "Very detailed instructions describing the action to be taken"
+                                            }
+                                        },
+                                        "required": ["instruction"]
+                                    }
+                                },
+                                {
+                                    "name": "mcp_Gmail_gmail-remove-label-from-email",
+                                    "description": "Remove label(s) from an email message",
+                                    "inputSchema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "instruction": {
+                                                "type": "string",
+                                                "description": "Very detailed instructions describing the action to be taken"
+                                            }
+                                        },
+                                        "required": ["instruction"]
+                                    }
+                                },
+                                {
+                                    "name": "mcp_Gmail_gmail-archive-email",
+                                    "description": "Archive an email message",
+                                    "inputSchema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "instruction": {
+                                                "type": "string",
+                                                "description": "Very detailed instructions describing the action to be taken"
+                                            }
+                                        },
+                                        "required": ["instruction"]
+                                    }
+                                },
+                                {
+                                    "name": "mcp_Gmail_gmail-delete-email",
+                                    "description": "Moves the specified message to the trash",
+                                    "inputSchema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "instruction": {
+                                                "type": "string",
+                                                "description": "Very detailed instructions describing the action to be taken"
+                                            }
+                                        },
+                                        "required": ["instruction"]
+                                    }
                                 }
                             ]
-                            logger.info(f"Hardcoded {len(self.available_tools)} Gmail tools")
+                            
+                            # Add specific tools based on the server type
+                            if "gmail" in self.uri:
+                                logger.info("Adding Gmail-specific tools")
+                                self.available_tools = base_tools
+                            else:
+                                # For other Pipedream servers, use base tools
+                                self.available_tools = base_tools
+                            
+                            logger.info(f"Hardcoded {len(self.available_tools)} tools for Pipedream server")
                             
                 except Exception as e:
                     logger.error(f"Failed to discover tools via HTTP: {e}")

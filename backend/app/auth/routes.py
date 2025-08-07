@@ -161,6 +161,8 @@ async def get_mcp_servers(token: str = Depends(oauth2_scheme)):
             })
         
         print(f"[DEBUG] Found {len(server_list)} MCP servers for user {email}")
+        for server in server_list:
+            print(f"[DEBUG] Server: {server['name']} (ID: {server['id']})")
         return server_list
         
     except Exception as e:
@@ -209,31 +211,49 @@ async def create_mcp_server(request: MCPServerRequest, token: str = Depends(oaut
                 "pipedream_workflow": True
             })
             
-            # Test the Pipedream connection
+            # Test the Pipedream connection (optional - don't fail if test fails)
             try:
                 test_result = await test_pipedream_connection(uri)
-                if not test_result["success"]:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Failed to connect to Pipedream workflow: {test_result['error']}"
-                    )
-                print(f"[DEBUG] Pipedream connection test successful: {test_result['tools_count']} tools found")
+                if test_result["success"]:
+                    print(f"[DEBUG] Pipedream connection test successful: {test_result['tools_count']} tools found")
+                else:
+                    print(f"[DEBUG] Pipedream connection test failed: {test_result['error']}")
+                    # Don't fail the creation, just log the warning
+                    config["connection_warning"] = f"Connection test failed: {test_result['error']}"
             except Exception as e:
                 print(f"[DEBUG] Pipedream connection test failed: {e}")
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Failed to test Pipedream connection: {str(e)}"
-                )
+                # Don't fail the creation, just log the warning
+                config["connection_warning"] = f"Connection test failed: {str(e)}"
         
-        # Create MCP server in database
-        server = await prisma.mcpserver.create(
-            data={
-                "userId": user.id,
-                "name": request.name,
-                "description": request.description,
-                "config": config
-            }
-        )
+                # Create MCP server in database
+        try:
+            # Ensure config is properly serialized as JSON string for Prisma
+            config_json = json.dumps(config) if isinstance(config, dict) else str(config)
+            
+            print(f"[DEBUG] Creating MCP server with data:")
+            print(f"  userId: {user.id}")
+            print(f"  name: {request.name}")
+            print(f"  description: {request.description}")
+            print(f"  config type: {type(config)}")
+            print(f"  config: {config}")
+            print(f"  config_json: {config_json}")
+            
+            server = await prisma.mcpserver.create(
+                data={
+                    "userId": user.id,
+                    "name": request.name,
+                    "description": request.description,
+                    "config": config_json
+                }
+            )
+        except Exception as db_error:
+            print(f"[DEBUG] Database error creating MCP server: {db_error}")
+            print(f"[DEBUG] Error type: {type(db_error)}")
+            await prisma.disconnect()
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Database error: {str(db_error)}"
+            )
         
         await prisma.disconnect()
         
@@ -253,7 +273,93 @@ async def create_mcp_server(request: MCPServerRequest, token: str = Depends(oaut
         raise
     except Exception as e:
         print(f"[DEBUG] Error creating MCP server: {e}")
-        raise HTTPException(status_code=500, detail="Failed to create MCP server.")
+        print(f"[DEBUG] Error type: {type(e)}")
+        print(f"[DEBUG] Error details: {str(e)}")
+        import traceback
+        print(f"[DEBUG] Full traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Failed to create MCP server: {str(e)}")
+
+@router.post("/mcp-servers/test")
+async def create_mcp_server_test(request: MCPServerRequest, token: str = Depends(oauth2_scheme)):
+    """Create a new MCP server for testing (without connection tests)"""
+    try:
+        payload = decode_access_token(token)
+        email = payload.get("sub")
+        if not email:
+            raise HTTPException(status_code=401, detail="Invalid token.")
+        
+        # Get user from database
+        prisma = Prisma()
+        await prisma.connect()
+        
+        # Find user by email
+        user = await prisma.user.find_unique(where={"email": email})
+        if not user:
+            await prisma.disconnect()
+            raise HTTPException(status_code=404, detail="User not found.")
+        
+        # Validate MCP server configuration (basic validation only)
+        config = request.config or {}
+        uri = config.get("uri", "")
+        
+        # Add test flag to config
+        config["test_mode"] = True
+        config["created_at"] = datetime.now().isoformat()
+        
+        # Create MCP server in database (no connection test)
+        try:
+            # Ensure config is properly serialized as JSON string for Prisma
+            config_json = json.dumps(config) if isinstance(config, dict) else str(config)
+            
+            print(f"[DEBUG] Creating test MCP server with data:")
+            print(f"  userId: {user.id}")
+            print(f"  name: {request.name}")
+            print(f"  description: {request.description}")
+            print(f"  config type: {type(config)}")
+            print(f"  config: {config}")
+            print(f"  config_json: {config_json}")
+            
+            server = await prisma.mcpserver.create(
+                data={
+                    "userId": user.id,
+                    "name": request.name,
+                    "description": request.description,
+                    "config": config_json
+                }
+            )
+        except Exception as db_error:
+            print(f"[DEBUG] Database error creating test MCP server: {db_error}")
+            print(f"[DEBUG] Error type: {type(db_error)}")
+            await prisma.disconnect()
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Database error: {str(db_error)}"
+            )
+        
+        await prisma.disconnect()
+        
+        # Return the created server
+        server_response = {
+            "id": server.id,
+            "name": server.name,
+            "description": server.description,
+            "config": server.config,
+            "createdAt": server.createdAt.isoformat(),
+            "test_mode": True
+        }
+        
+        print(f"[DEBUG] Created test MCP server: {server_response['name']} for user {email}")
+        return server_response
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[DEBUG] Error creating test MCP server: {e}")
+        print(f"[DEBUG] Error type: {type(e)}")
+        print(f"[DEBUG] Error details: {str(e)}")
+        import traceback
+        print(f"[DEBUG] Full traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Failed to create test MCP server: {str(e)}")
 
 @router.delete("/mcp-servers/{server_id}")
 async def delete_mcp_server(server_id: int, token: str = Depends(oauth2_scheme)):

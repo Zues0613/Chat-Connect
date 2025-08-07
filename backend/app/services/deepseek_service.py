@@ -74,8 +74,14 @@ class DeepSeekService:
                 request_params['tools'] = tools
                 request_params['tool_choice'] = 'auto'
 
-            # Send request
-            response = await self.client.chat.completions.create(**request_params)
+            # Send request with timeout
+            try:
+                response = await asyncio.wait_for(
+                    self.client.chat.completions.create(**request_params),
+                    timeout=30.0  # 30 second timeout
+                )
+            except asyncio.TimeoutError:
+                raise Exception("Request to DeepSeek API timed out after 30 seconds")
             
             # Extract response
             assistant_message = response.choices[0].message

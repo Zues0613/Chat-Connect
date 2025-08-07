@@ -11,6 +11,8 @@ from app.auth.jwt_handler import decode_access_token
 from app.services.deepseek_service import deepseek_service
 from app.services.mcp_service import mcp_service
 from app.services.mcp_service_deepseek import mcp_service_deepseek
+from app.services.intent_detector import intent_detector
+from app.services.confirmation_handler import confirmation_handler
 
 router = APIRouter()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
@@ -493,8 +495,8 @@ async def get_user_deepseek_api_key(email: str) -> Optional[str]:
         import os
         return os.getenv("DEFAULT_DEEPSEEK_API_KEY")
 
-async def initialize_mcp_servers(user_id: int) -> None:
-    """Initialize all MCP servers for the user"""
+async def get_available_mcp_server_names(user_id: int) -> List[str]:
+    """Get list of available MCP server names for a user"""
     try:
         prisma = Prisma()
         await prisma.connect()
@@ -504,7 +506,51 @@ async def initialize_mcp_servers(user_id: int) -> None:
         
         await prisma.disconnect()
         
-        # Connect to each server
+        # Extract server names (assuming they're stored in a name field)
+        server_names = []
+        for server in servers:
+            # Try to get server name from config or name field
+            if hasattr(server, 'name') and server.name:
+                server_names.append(server.name.lower())
+            elif hasattr(server, 'config') and server.config:
+                # Try to extract name from config
+                try:
+                    if isinstance(server.config, str):
+                        config = json.loads(server.config)
+                    else:
+                        config = server.config
+                    
+                    if 'name' in config:
+                        server_names.append(config['name'].lower())
+                    elif 'type' in config:
+                        server_names.append(config['type'].lower())
+                except:
+                    pass
+        
+        return server_names
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to get MCP server names: {e}")
+        return []
+
+async def initialize_mcp_servers(user_id: int) -> None:
+    """Initialize all MCP servers for the user (non-blocking)"""
+    try:
+        prisma = Prisma()
+        await prisma.connect()
+        
+        # Get all MCP servers for user
+        servers = await prisma.mcpserver.find_many(where={"userId": user_id})
+        
+        await prisma.disconnect()
+        
+        if not servers:
+            print(f"[INFO] No MCP servers configured for user {user_id}")
+            return
+        
+        print(f"[DEBUG] Found {len(servers)} MCP servers for user {user_id}")
+        
+        # Connect to each server with timeout
         for server in servers:
             server_id = f"user_{user_id}_server_{server.id}"
             
@@ -519,23 +565,32 @@ async def initialize_mcp_servers(user_id: int) -> None:
                 config['name'] = server.name
                 
                 print(f"[DEBUG] Connecting to MCP server: {server.name}")
-                print(f"[DEBUG] Config: {json.dumps(config, indent=2)}")
                 
-                success = await mcp_service.connect_to_server(server_id, config)
-                
-                if success:
-                    print(f"[DEBUG] Successfully connected to MCP server: {server.name}")
-                else:
-                    print(f"[DEBUG] Failed to connect to MCP server: {server.name}")
+                # Add timeout to server connection
+                try:
+                    success = await asyncio.wait_for(
+                        mcp_service.connect_to_server(server_id, config),
+                        timeout=5.0  # Reduced timeout for faster startup
+                    )
+                    
+                    if success:
+                        print(f"[DEBUG] Successfully connected to MCP server: {server.name}")
+                    else:
+                        print(f"[DEBUG] Failed to connect to MCP server: {server.name}")
+                        
+                except asyncio.TimeoutError:
+                    print(f"[WARNING] Timeout connecting to MCP server: {server.name}")
+                except Exception as e:
+                    print(f"[ERROR] Failed to connect to server {server.name}: {e}")
                     
             except json.JSONDecodeError as e:
                 print(f"[ERROR] Failed to parse config for server {server.name}: {e}")
-                print(f"[ERROR] Raw config: {server.config}")
             except Exception as e:
                 print(f"[ERROR] Failed to connect to server {server.name}: {e}")
         
     except Exception as e:
         print(f"[ERROR] Failed to initialize MCP servers: {e}")
+        # Don't raise the exception - MCP servers are optional
 
 @router.post("/chats/{chat_id}/messages")
 async def send_message(
@@ -575,6 +630,191 @@ async def send_message(
             await prisma.disconnect()
             raise HTTPException(status_code=400, detail="No DeepSeek API key available. Please contact administrator or add your own API key in settings.")
         
+        # Check for confirmation commands first
+        if request.content.lower().startswith(('confirm ', 'cancel ')):
+            # Handle confirmation commands
+            parts = request.content.split(' ', 1)
+            if len(parts) == 2:
+                command, confirmation_id = parts
+                
+                if command.lower() == 'confirm':
+                    confirmation = confirmation_handler.confirm_action(confirmation_id)
+                    if confirmation and confirmation.user_id == user.id:
+                        # Mark as executed and proceed with MCP action
+                        confirmation_handler.execute_confirmed_action(confirmation_id)
+                        
+                        # Store user confirmation message
+                        user_message = await prisma.message.create(
+                            data={
+                                "chatSessionId": chat_id,
+                                "content": request.content,
+                                "role": "user"
+                            }
+                        )
+                        
+                        # Proceed with MCP action execution
+                        return await _execute_mcp_action(chat_id, user.id, confirmation, prisma)
+                    else:
+                        # Invalid or expired confirmation
+                        user_message = await prisma.message.create(
+                            data={
+                                "chatSessionId": chat_id,
+                                "content": request.content,
+                                "role": "user"
+                            }
+                        )
+                        
+                        assistant_message = await prisma.message.create(
+                            data={
+                                "chatSessionId": chat_id,
+                                "content": "❌ Invalid or expired confirmation. Please make your request again.",
+                                "role": "assistant"
+                            }
+                        )
+                        
+                        await prisma.disconnect()
+                        
+                        return {
+                            "user_message": MessageResponse(
+                                id=user_message.id,
+                                content=user_message.content,
+                                role=user_message.role,
+                                createdAt=user_message.createdAt.isoformat()
+                            ),
+                            "assistant_message": MessageResponse(
+                                id=assistant_message.id,
+                                content=assistant_message.content,
+                                role=assistant_message.role,
+                                createdAt=assistant_message.createdAt.isoformat()
+                            )
+                        }
+                
+                elif command.lower() == 'cancel':
+                    confirmation = confirmation_handler.get_confirmation(confirmation_id)
+                    if confirmation and confirmation.user_id == user.id:
+                        confirmation_handler.cancel_confirmation(confirmation_id)
+                        
+                        # Store user cancellation message
+                        user_message = await prisma.message.create(
+                            data={
+                                "chatSessionId": chat_id,
+                                "content": request.content,
+                                "role": "user"
+                            }
+                        )
+                        
+                        assistant_message = await prisma.message.create(
+                            data={
+                                "chatSessionId": chat_id,
+                                "content": confirmation_handler.generate_cancellation_message(confirmation),
+                                "role": "assistant"
+                            }
+                        )
+                        
+                        await prisma.disconnect()
+                        
+                        return {
+                            "user_message": MessageResponse(
+                                id=user_message.id,
+                                content=user_message.content,
+                                role=user_message.role,
+                                createdAt=user_message.createdAt.isoformat()
+                            ),
+                            "assistant_message": MessageResponse(
+                                id=assistant_message.id,
+                                content=assistant_message.content,
+                                role=assistant_message.role,
+                                createdAt=assistant_message.createdAt.isoformat()
+                            )
+                        }
+        
+        # Check for intent detection
+        available_mcp_servers = await get_available_mcp_server_names(user.id)
+        intent_match = intent_detector.detect_intent(request.content, available_mcp_servers)
+        
+        if intent_match:
+            # Intent detected - handle based on MCP server availability
+            if not intent_match.available_mcp_servers:
+                # No MCP servers available - provide setup guide
+                user_message = await prisma.message.create(
+                    data={
+                        "chatSessionId": chat_id,
+                        "content": request.content,
+                        "role": "user"
+                    }
+                )
+                
+                assistant_message = await prisma.message.create(
+                    data={
+                        "chatSessionId": chat_id,
+                        "content": intent_detector.generate_response(intent_match),
+                        "role": "assistant"
+                    }
+                )
+                
+                await prisma.disconnect()
+                
+                return {
+                    "user_message": MessageResponse(
+                        id=user_message.id,
+                        content=user_message.content,
+                        role=user_message.role,
+                        createdAt=user_message.createdAt.isoformat()
+                    ),
+                    "assistant_message": MessageResponse(
+                        id=assistant_message.id,
+                        content=assistant_message.content,
+                        role=assistant_message.role,
+                        createdAt=assistant_message.createdAt.isoformat()
+                    )
+                }
+            else:
+                # MCP servers available - create confirmation
+                confirmation_id = confirmation_handler.create_confirmation(
+                    user_id=user.id,
+                    chat_id=chat_id,
+                    intent_type=intent_match.intent_type,
+                    original_message=request.content,
+                    mcp_servers=intent_match.available_mcp_servers
+                )
+                
+                confirmation = confirmation_handler.get_confirmation(confirmation_id)
+                
+                # Store user message
+                user_message = await prisma.message.create(
+                    data={
+                        "chatSessionId": chat_id,
+                        "content": request.content,
+                        "role": "user"
+                    }
+                )
+                
+                assistant_message = await prisma.message.create(
+                    data={
+                        "chatSessionId": chat_id,
+                        "content": confirmation_handler.generate_confirmation_message(confirmation),
+                        "role": "assistant"
+                    }
+                )
+                
+                await prisma.disconnect()
+                
+                return {
+                    "user_message": MessageResponse(
+                        id=user_message.id,
+                        content=user_message.content,
+                        role=user_message.role,
+                        createdAt=user_message.createdAt.isoformat()
+                    ),
+                    "assistant_message": MessageResponse(
+                        id=assistant_message.id,
+                        content=assistant_message.content,
+                        role=assistant_message.role,
+                        createdAt=assistant_message.createdAt.isoformat()
+                    )
+                }
+        
+        # No intent detected or no MCP servers - proceed with regular chat
         # Store user message
         user_message = await prisma.message.create(
             data={
@@ -614,18 +854,34 @@ async def send_message(
             await prisma.disconnect()
             raise HTTPException(status_code=500, detail="Failed to start chat session.")
         
-        # Initialize MCP servers and get tools for DeepSeek
-        print(f"[DEBUG] Initializing MCP servers for user {user.id}")
-        await initialize_mcp_servers(user.id)
+        # Initialize MCP servers and get tools for DeepSeek (OPTIONAL - non-blocking)
+        mcp_tools = []
         
-        # Get MCP tools in OpenAI format for DeepSeek
-        mcp_tools = mcp_service.get_openai_tools()
-        print(f"[DEBUG] Available MCP tools for DeepSeek: {len(mcp_tools)} tools")
+        # Check if MCP servers are enabled
+        import os
+        mcp_enabled = os.getenv("ENABLE_MCP_SERVERS", "true").lower() == "true"
         
-        if mcp_tools:
-            print(f"[DEBUG] Tool names: {[tool['function']['name'] for tool in mcp_tools]}")
+        if mcp_enabled:
+            try:
+                print(f"[DEBUG] Initializing MCP servers for user {user.id}")
+                await initialize_mcp_servers(user.id)
+                
+                # Get MCP tools in OpenAI format for DeepSeek
+                mcp_tools = mcp_service.get_openai_tools()
+                print(f"[DEBUG] Available MCP tools for DeepSeek: {len(mcp_tools)} tools")
+                
+                if mcp_tools:
+                    print(f"[DEBUG] Tool names: {[tool['function']['name'] for tool in mcp_tools]}")
+            except Exception as e:
+                print(f"[INFO] MCP servers not available - continuing with regular chat: {e}")
+                # Continue without MCP tools - this is normal for general chat usage
+                mcp_tools = None
+        else:
+            print(f"[INFO] MCP servers disabled - using regular chat mode")
+            mcp_tools = None
         
-        # Send message to DeepSeek with MCP tools
+        # Send message to DeepSeek (with or without MCP tools)
+        print(f"[DEBUG] Sending message to DeepSeek...")
         response = await deepseek_service.send_message(request.content, tools=mcp_tools if mcp_tools else None)
         
         # Handle tool calls if DeepSeek wants to use tools
@@ -713,6 +969,86 @@ async def send_message(
         print(f"[ERROR] Failed to send message: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to send message: {e}")
 
+async def _execute_mcp_action(chat_id: int, user_id: int, confirmation, prisma) -> Dict:
+    """Execute a confirmed MCP action"""
+    try:
+        # Get user's DeepSeek API key
+        user = await prisma.user.find_unique(where={"id": user_id})
+        deepseek_api_key = await get_user_deepseek_api_key(user.email)
+        
+        if not deepseek_api_key:
+            raise HTTPException(status_code=400, detail="No DeepSeek API key available.")
+        
+        # Initialize DeepSeek
+        if not deepseek_service.initialize_with_api_key(deepseek_api_key):
+            raise HTTPException(status_code=400, detail="Failed to initialize DeepSeek API.")
+        
+        # Initialize MCP servers
+        await initialize_mcp_servers(user_id)
+        
+        # Get MCP tools
+        mcp_tools = mcp_service.get_openai_tools()
+        
+        # Send the original message to DeepSeek with MCP tools
+        response = await deepseek_service.send_message(confirmation.original_message, tools=mcp_tools if mcp_tools else None)
+        
+        # Handle tool calls if any
+        if response.get("type") == "tool_calls":
+            tool_results = []
+            for tool_call in response.get("tool_calls", []):
+                try:
+                    tool_result = await mcp_service_deepseek.execute_tool_with_health_check(tool_call)
+                    tool_results.append({
+                        "tool_call_id": tool_call.id,
+                        "result": tool_result
+                    })
+                except Exception as e:
+                    print(f"[ERROR] Failed to call tool: {e}")
+                    tool_results.append({
+                        "tool_call_id": tool_call.id,
+                        "result": {"error": f"Tool call failed: {str(e)}"}
+                    })
+            
+            # Send tool results back to DeepSeek
+            if tool_results:
+                response = await deepseek_service.send_tool_results(tool_results)
+                assistant_content = response.get("content", "I'm sorry, I couldn't process the tool results.")
+            else:
+                assistant_content = "I'm sorry, I couldn't execute the requested tools."
+        else:
+            assistant_content = response.get("content", "I'm sorry, I couldn't generate a response.")
+        
+        # Store assistant message
+        assistant_message = await prisma.message.create(
+            data={
+                "chatSessionId": chat_id,
+                "content": assistant_content,
+                "role": "assistant"
+            }
+        )
+        
+        await prisma.disconnect()
+        
+        return {
+            "user_message": MessageResponse(
+                id=confirmation.confirmation_id,  # Use confirmation ID as placeholder
+                content=confirmation.original_message,
+                role="user",
+                createdAt=confirmation.created_at.isoformat()
+            ),
+            "assistant_message": MessageResponse(
+                id=assistant_message.id,
+                content=assistant_message.content,
+                role=assistant_message.role,
+                createdAt=assistant_message.createdAt.isoformat()
+            )
+        }
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to execute MCP action: {e}")
+        await prisma.disconnect()
+        raise HTTPException(status_code=500, detail=f"Failed to execute MCP action: {str(e)}")
+
 @router.post("/chats/{chat_id}/messages/stream")
 async def send_message_stream(
     chat_id: int,
@@ -774,18 +1110,33 @@ async def send_message_stream(
                 yield f"data: {json.dumps({'error': 'Failed to start chat session'})}\n\n"
                 return
             
-            # Initialize MCP servers and get tools for DeepSeek
-            print(f"[DEBUG] Initializing MCP servers for user {user.id}")
-            await initialize_mcp_servers(user.id)
+            # Initialize MCP servers and get tools for DeepSeek (OPTIONAL - non-blocking)
+            mcp_tools = []
             
-            # Get MCP tools in OpenAI format for DeepSeek
-            mcp_tools = mcp_service.get_openai_tools()
-            print(f"[DEBUG] Available MCP tools for DeepSeek streaming: {len(mcp_tools)} tools")
+            # Check if MCP servers are enabled
+            import os
+            mcp_enabled = os.getenv("ENABLE_MCP_SERVERS", "true").lower() == "true"
             
-            if mcp_tools:
-                print(f"[DEBUG] Tool names: {[tool['function']['name'] for tool in mcp_tools]}")
+            if mcp_enabled:
+                try:
+                    print(f"[DEBUG] Initializing MCP servers for user {user.id}")
+                    await initialize_mcp_servers(user.id)
+                    
+                    # Get MCP tools in OpenAI format for DeepSeek
+                    mcp_tools = mcp_service.get_openai_tools()
+                    print(f"[DEBUG] Available MCP tools for DeepSeek streaming: {len(mcp_tools)} tools")
+                    
+                    if mcp_tools:
+                        print(f"[DEBUG] Tool names: {[tool['function']['name'] for tool in mcp_tools]}")
+                except Exception as e:
+                    print(f"[INFO] MCP servers not available for streaming - continuing with regular chat: {e}")
+                    # Continue without MCP tools - this is normal for general chat usage
+                    mcp_tools = None
+            else:
+                print(f"[INFO] MCP servers disabled for streaming - using regular chat mode")
+                mcp_tools = None
             
-            # Stream response from DeepSeek with MCP tools
+            # Stream response from DeepSeek (with or without MCP tools)
             full_response = ""
             async for chunk in deepseek_service.send_message_stream(request.content, tools=mcp_tools if mcp_tools else None):
                 full_response += chunk
@@ -824,13 +1175,32 @@ async def get_available_tools(token: str = Depends(oauth2_scheme)):
         if not email:
             raise HTTPException(status_code=401, detail="Invalid token.")
         
+        prisma = Prisma()
+        await prisma.connect()
+        
+        # Get user
+        user = await prisma.user.find_unique(where={"email": email})
+        if not user:
+            await prisma.disconnect()
+            raise HTTPException(status_code=404, detail="User not found.")
+        
+        await prisma.disconnect()
+        
+        # Initialize MCP servers for this user
+        print(f"[DEBUG] Initializing MCP servers for user {user.id}")
+        await initialize_mcp_servers(user.id)
+        
         # Get all available tools from connected MCP servers
         tools = mcp_service.get_all_tools()
         connected_servers = mcp_service.get_connected_servers()
         
+        print(f"[DEBUG] Found {len(tools)} tools and {len(connected_servers)} connected servers")
+        
         return {
             "tools": tools,
-            "connected_servers": connected_servers
+            "connected_servers": connected_servers,
+            "total_tools": len(tools),
+            "total_servers": len(connected_servers)
         }
         
     except Exception as e:
