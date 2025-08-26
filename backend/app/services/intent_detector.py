@@ -43,10 +43,12 @@ class IntentDetector:
             "file_operations": {
                 "patterns": [
                     r"\b(create|write|save|edit|modify|update)\s+(?:a\s+)?(?:file|document|text)\b",
-                    r"\b(read|open|view|show)\s+(?:a\s+)?(?:file|document)\b",
+                    r"\b(read|open|view|show|list)\s+(?:my\s+|the\s+)?(?:files?|documents?)\b",
                     r"\bsearch\s+(?:for\s+)?(?:files?|documents?)\b",
                     r"\b(delete|remove|trash)\s+(?:a\s+)?(?:file|document)\b",
-                    r"\b(organize|sort|move)\s+(?:files?|documents?)\b"
+                    r"\b(organize|sort|move)\s+(?:files?|documents?)\b",
+                    r"\bgoogle\s+drive\b",
+                    r"\b(list|show|view)\s+(?:my\s+)?google\s+drive\s+files\b"
                 ],
                 "mcp_servers": ["filesystem", "google_drive", "dropbox"],
                 "description": "File and document operations",
@@ -68,7 +70,7 @@ class IntentDetector:
             "web_search": {
                 "patterns": [
                     r"\b(search|find|look up)\s+(?:for\s+)?(?:information|data|news)\b",
-                    r"\b(google|bing|search\s+engine)\b",
+                    r"\b(google(?!\s*drive)|bing|search\s+engine)\b",
                     r"\b(latest|current|recent)\s+(?:news|information)\b",
                     r"\b(weather|temperature)\s+(?:in|for)\b"
                 ],

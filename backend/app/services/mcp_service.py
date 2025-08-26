@@ -882,15 +882,15 @@ class MCPService:
         error_type = error_result.get("error_type", "unknown")
         
         if error_type == "tool_not_available":
-            available_tools = error_result.get("available_tools", [])
-            connected_servers = error_result.get("connected_servers", [])
-            
-            if available_tools:
-                return f"❌ The MCP server for '{tool_name}' is not available. Available tools: {', '.join(available_tools[:5])}{'...' if len(available_tools) > 5 else ''}"
-            elif connected_servers:
-                return f"❌ The MCP server for '{tool_name}' is not available. Connected servers: {', '.join(connected_servers)}"
-            else:
-                return f"❌ The MCP server for '{tool_name}' is not available. No MCP servers are currently connected."
+            guide = (
+                "❌ The requested function is not available because the required MCP server isn't connected.\n\n"
+                "How to fix this:\n"
+                "1. Open Settings → MCP Servers\n"
+                "2. Click Quick Add MCP and paste your Pipedream MCP URL (format: https://mcp.pipedream.net/[workflow-id]/[endpoint])\n"
+                "3. Save and refresh servers/tools\n"
+                "4. Re-run your request"
+            )
+            return guide
         
         elif error_type == "connection_error":
             server_name = error_result.get("server_name", "Unknown")

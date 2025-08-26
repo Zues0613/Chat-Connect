@@ -75,7 +75,8 @@ class PipedreamHealthChecker:
                 "params": {}
             }
             
-            timeout = httpx.Timeout(connect=10.0, read=30.0)
+            # httpx requires either a default or all four params; set all explicitly
+            timeout = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=30.0)
             async with httpx.AsyncClient(timeout=timeout) as client:
                 response = await client.post(
                     workflow_url,
@@ -174,8 +175,8 @@ class MCPServiceDeepSeek:
         self.logger = MCPLogger()
         self.session_endpoints = {}
         # Increased timeout values
-        self.pipedream_timeout = int(os.getenv("PIPEDREAM_TIMEOUT", "300"))  # 5 minutes
-        self.session_timeout = int(os.getenv("MCP_TIMEOUT", "300"))  # 5 minutes
+        self.pipedream_timeout = int(os.getenv("PIPEDREAM_TIMEOUT", "90"))  # default 90s to avoid UI timeouts
+        self.session_timeout = int(os.getenv("MCP_TIMEOUT", "120"))
         self.health_checker = PipedreamHealthChecker()
         self.email_fallback = EmailFallbackService()
     
@@ -267,24 +268,30 @@ class MCPServiceDeepSeek:
             # Health check first
             health_result = await self.health_checker.check_workflow_health(workflow_url)
             
-            if not health_result["healthy"]:
-                return {
-                    "success": False,
-                    "error": f"Pipedream workflow health check failed: {health_result['error']}",
-                    "suggestion": self._get_workflow_optimization_suggestions(),
-                    "health_details": health_result
-                }
+            if not health_result.get("healthy"):
+                # Don't block execution; warn and try anyway to mimic no-OAuth/no-gate flows
+                logger.warning(f"Pipedream health check reported unhealthy: {health_result}")
             
             # If health check shows slow response, warn user
             if health_result.get("response_time", 0) > 10:
                 logger.warning(f"⚠️ Pipedream workflow is slow (response time: {health_result['response_time']}s)")
         
-        # Proceed with normal execution
-        return await self.execute_tool_with_confirmation(function_call)
+        # Proceed with normal execution; if it fails, attach suggestions
+        result = await self.execute_tool_with_confirmation(function_call)
+        if not result.get("success") and self._is_pipedream_workflow(function_call.name):
+            result.setdefault("suggestion", self._get_workflow_optimization_suggestions())
+        return result
     
     def _is_pipedream_workflow(self, function_name: str) -> bool:
         """Check if function is a Pipedream workflow"""
-        return "gmail" in function_name.lower() or "mcp_Gmail" in function_name
+        # Treat any mcp_* names or common providers as Pipedream-capable
+        name_lower = function_name.lower()
+        return (
+            name_lower.startswith("mcp_")
+            or "gmail" in name_lower
+            or "google_drive" in name_lower
+            or "drive" in name_lower
+        )
     
     def _get_workflow_url(self, function_name: str) -> str:
         """Get workflow URL for a function"""
@@ -328,6 +335,24 @@ class MCPServiceDeepSeek:
             # 1. Validate function call
             validation = self.validate_function_call(function_call.name, function_call.parameters)
             if not validation.valid:
+                # If the function itself isn't found, guide user to add MCP server
+                if any("not found" in e.lower() for e in validation.errors):
+                    error_msg = f"Function '{function_call.name}' is not available on any connected MCP server"
+                    suggestion = (
+                        "To use this function, add the appropriate MCP server first.\n\n"
+                        "Steps:\n"
+                        "1. Open Settings → MCP Servers\n"
+                        "2. Click Quick Add MCP and paste your Pipedream MCP URL (format: https://mcp.pipedream.net/[workflow-id]/[endpoint])\n"
+                        "3. Save, then refresh servers and tools\n"
+                        "4. Try your request again"
+                    )
+                    self.logger.log_execution_result(False, {"error": error_msg})
+                    return {
+                        "success": False,
+                        "error": error_msg,
+                        "error_type": "tool_not_available",
+                        "suggestion": suggestion
+                    }
                 error_msg = f"Invalid parameters: {', '.join(validation.errors)}"
                 self.logger.log_execution_result(False, {"error": error_msg})
                 return {
@@ -337,6 +362,7 @@ class MCPServiceDeepSeek:
                 }
             
             # 2. Execute the function
+            # Prefer server that actually exposes this tool
             result = await self.execute_tool(function_call.name, function_call.parameters)
             
             # 3. Verify execution (DeepSeek R1 specific)
@@ -370,6 +396,33 @@ class MCPServiceDeepSeek:
         })
         
         try:
+            # Normalize common aliases and arguments
+            orig_name = tool_name
+            tool_name = (tool_name or "").strip()
+            normalized_args = arguments.copy() if arguments else {}
+            alias_map = {
+                "google_drive-create-document": "google_drive-create-file-from-text",
+                "google_drive-create-doc": "google_drive-create-file-from-text",
+                "create-google-doc": "google_drive-create-file-from-text",
+            }
+            if tool_name in alias_map:
+                tool_name = alias_map[tool_name]
+                # Map typical fields
+                if "title" in normalized_args and "name" not in normalized_args:
+                    normalized_args["name"] = normalized_args.pop("title")
+                if "content" in normalized_args and "text" not in normalized_args:
+                    normalized_args["text"] = normalized_args.pop("content")
+                # Default to Google Docs mime type
+                normalized_args.setdefault("mimeType", "application/vnd.google-apps.document")
+                # Folder mapping
+                if "folder" in normalized_args and "parents" not in normalized_args:
+                    folder = normalized_args.pop("folder")
+                    normalized_args["parents"] = [folder if isinstance(folder, str) else "root"]
+                if "folder_id" in normalized_args and "parents" not in normalized_args:
+                    folder_id = normalized_args.pop("folder_id")
+                    normalized_args["parents"] = [folder_id]
+                arguments = normalized_args
+
             # Find the server that has this tool
             target_server = None
             if server_id and server_id in self.servers:
@@ -381,9 +434,17 @@ class MCPServiceDeepSeek:
                         break
             
             if not target_server:
-                error_msg = f"Tool '{tool_name}' not available on any connected server"
+                error_msg = f"Tool '{orig_name}' not available on any connected server"
                 self.logger.log_execution_result(False, {"error": error_msg})
-                return {"error": error_msg}
+                guide = (
+                    "You need to add a compatible MCP server before using this function.\n\n"
+                    "Steps:\n"
+                    "1. Go to Settings → MCP Servers\n"
+                    "2. Click Quick Add MCP and paste your Pipedream MCP URL for this capability\n"
+                    "3. Save and refresh tools\n"
+                    "4. Re-run your request"
+                )
+                return {"error": error_msg, "error_type": "tool_not_available", "suggestion": guide}
             
             # Execute the tool
             result = await target_server.call_tool(tool_name, arguments)
@@ -484,15 +545,71 @@ class MCPServiceDeepSeek:
         tools = []
         for server_id, client in self.servers.items():
             for tool in client.available_tools:
+                # Fix common tool schemas for better compatibility
+                tool_name = tool.get('name', '')
+                tool_description = tool.get('description', '')
+                tool_parameters = tool.get('parameters', {})
+                
+                # Fix specific tool schemas
+                if tool_name == 'google_drive-list-files':
+                    # Ensure the tool has the correct parameter schema
+                    if not tool_parameters or 'properties' not in tool_parameters:
+                        tool_parameters = {
+                            "type": "object",
+                            "properties": {
+                                "instruction": {
+                                    "type": "string",
+                                    "description": "What files to list (e.g., 'List all files in root directory')"
+                                },
+                                "folder_id": {
+                                    "type": "string",
+                                    "description": "ID of the folder to list files from (default: 'root')"
+                                }
+                            },
+                            "required": ["instruction"]
+                        }
+                    tool_description = "List files and folders from Google Drive. Use 'instruction' to specify what you want to list."
+                
+                elif tool_name == 'google_drive-find-file':
+                    if not tool_parameters or 'properties' not in tool_parameters:
+                        tool_parameters = {
+                            "type": "object",
+                            "properties": {
+                                "instruction": {
+                                    "type": "string",
+                                    "description": "What file to find (e.g., 'Find documents with keyword X')"
+                                }
+                            },
+                            "required": ["instruction"]
+                        }
+                    tool_description = "Find specific files in Google Drive based on your instruction."
+                
+                elif tool_name == 'google_drive-find-folder':
+                    if not tool_parameters or 'properties' not in tool_parameters:
+                        tool_parameters = {
+                            "type": "object",
+                            "properties": {
+                                "instruction": {
+                                    "type": "string",
+                                    "description": "What folder to find (e.g., 'Find folder named X')"
+                                }
+                            },
+                            "required": ["instruction"]
+                        }
+                    tool_description = "Find specific folders in Google Drive based on your instruction."
+                
                 openai_tool = {
                     "type": "function",
                     "function": {
-                        "name": tool.get('name', ''),
-                        "description": tool.get('description', ''),
-                        "parameters": tool.get('parameters', {})
+                        "name": tool_name,
+                        "description": tool_description,
+                        "parameters": tool_parameters
                     }
                 }
                 tools.append(openai_tool)
+                print(f"[DEBUG] Added tool: {tool_name} with parameters: {tool_parameters}")
+        
+        print(f"[DEBUG] Total tools returned: {len(tools)}")
         return tools
     
     def get_connected_servers(self) -> List[Dict[str, Any]]:
@@ -546,34 +663,65 @@ class MCPClientDeepSeek:
         """Connect to custom HTTP-based MCP server (e.g., Pipedream)"""
         try:
             async with aiohttp.ClientSession() as session:
-                # Special handling for Pipedream servers
+                # Special handling for Pipedream servers: prefer JSON-RPC POST over GET/SSE
                 if "pipedream.net" in self.uri:
                     logger.info(f"Establishing Pipedream MCP session: {self.uri}")
-                    async with session.get(self.uri) as response:
-                        if response.status == 200:
-                            response_text = await response.text()
-                            lines = response_text.strip().split('\n')
-                            session_endpoint = None
-                            for line in lines:
-                                if line.startswith('data: '):
+                    tools_request = {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/list"
+                    }
+                    try:
+                        timeout = aiohttp.ClientTimeout(total=10)
+                        async with session.post(
+                            self.uri,
+                            json=tools_request,
+                            headers={
+                                "Content-Type": "application/json",
+                                "Accept": "application/json, text/event-stream"
+                            },
+                            timeout=timeout
+                        ) as response:
+                            if response.status == 200:
+                                content_type = response.headers.get('content-type', '')
+                                if 'text/event-stream' in content_type:
+                                    text = await response.text()
+                                    for line in text.strip().split('\n'):
+                                        if line.startswith('data: '):
+                                            try:
+                                                data_json = line[6:]
+                                                data = json.loads(data_json)
+                                                if "result" in data and "tools" in data["result"]:
+                                                    self.available_tools = data["result"]["tools"]
+                                                    break
+                                            except Exception:
+                                                continue
+                                else:
                                     try:
-                                        data_json = line[6:]
-                                        if data_json.startswith('/v1/'):
-                                            self.session_endpoint = data_json
-                                            break
-                                    except:
-                                        continue
-                            if self.session_endpoint:
+                                        data = await response.json()
+                                        if "result" in data and "tools" in data["result"]:
+                                            self.available_tools = data["result"]["tools"]
+                                    except Exception as e:
+                                        logger.warning(f"Pipedream tools/list JSON parse failed: {e}")
+                            else:
+                                logger.warning(f"Pipedream tools/list returned HTTP {response.status}")
+                    except Exception as e:
+                        logger.warning(f"Pipedream initial tools/list check failed: {e}")
+                    # Consider connected to allow later discovery and calls
+                    self.is_connected = True
+                    await self._discover_tools()
+                    return True
+                else:
+                    # Standard HTTP connection: try GET /health then proceed
+                    try:
+                        timeout = aiohttp.ClientTimeout(total=5)
+                        async with session.get(self.uri, timeout=timeout) as response:
+                            if response.status in (200, 405):
                                 self.is_connected = True
                                 await self._discover_tools()
                                 return True
-                else:
-                    # Standard HTTP connection
-                    async with session.get(self.uri) as response:
-                        if response.status == 200:
-                            self.is_connected = True
-                            await self._discover_tools()
-                            return True
+                    except Exception:
+                        pass
             
             self.last_error = "Failed to establish connection"
             return False
@@ -693,16 +841,18 @@ class MCPClientDeepSeek:
     async def _discover_pipedream_tools(self) -> None:
         """Discover tools from Pipedream server"""
         try:
-            if not self.session_endpoint:
-                logger.error("No session endpoint available for Pipedream")
-                return
-            
-            async with aiohttp.ClientSession() as session:
-                base_uri = self.uri.rstrip('/')
+            base_uri = self.uri.rstrip('/')
+            # Prefer session endpoint when available; otherwise try base URI directly
+            if self.session_endpoint:
                 if self.session_endpoint.startswith('/'):
                     target_uri = base_uri + self.session_endpoint
                 else:
                     target_uri = base_uri + '/' + self.session_endpoint
+            else:
+                logger.info("No session endpoint available for Pipedream, trying base URI for tools/list")
+                target_uri = base_uri
+            
+            async with aiohttp.ClientSession() as session:
                 
                 tools_request = {
                     "jsonrpc": "2.0",
@@ -734,9 +884,25 @@ class MCPClientDeepSeek:
                                         if "result" in tools_data and "tools" in tools_data["result"]:
                                             self.available_tools = tools_data["result"]["tools"]
                                             logger.info(f"Discovered {len(self.available_tools)} tools from Pipedream")
+                                            print(f"[DEBUG] Pipedream tools discovered: {[t.get('name', 'unknown') for t in self.available_tools]}")
+                                            
+                                            # Debug the first tool to see its schema
+                                            if self.available_tools:
+                                                first_tool = self.available_tools[0]
+                                                print(f"[DEBUG] First tool schema: {json.dumps(first_tool, indent=2)}")
+                                            
                                             break
                                     except:
                                         continue
+                        else:
+                            # Handle regular JSON response
+                            try:
+                                tools_data = await response.json()
+                                if "result" in tools_data and "tools" in tools_data["result"]:
+                                    self.available_tools = tools_data["result"]["tools"]
+                                    logger.info(f"Discovered {len(self.available_tools)} tools from Pipedream (JSON)")
+                            except Exception as e:
+                                logger.error(f"Failed to parse Pipedream JSON tools response: {e}")
         except Exception as e:
             logger.error(f"Failed to discover Pipedream tools: {e}")
     
@@ -784,18 +950,68 @@ class MCPClientDeepSeek:
         try:
             logger.info(f"Calling tool {tool_name} on {self.server_name} with arguments: {arguments}")
             
-            if self.server_type == "custom" and "pipedream.net" in self.uri:
-                return await self._call_pipedream_tool(tool_name, arguments)
+            # Validate and enhance arguments for common tools
+            enhanced_arguments = self._enhance_tool_arguments(tool_name, arguments)
+            
+            if self.server_type == "custom" and ("pipedream.net" in self.uri or "mcp.pipedream.net" in self.uri):
+                return await self._call_pipedream_tool(tool_name, enhanced_arguments)
             elif self.server_type == "stdio":
-                return await self._call_stdio_tool(tool_name, arguments)
+                return await self._call_stdio_tool(tool_name, enhanced_arguments)
             elif self.server_type == "websocket":
-                return await self._call_websocket_tool(tool_name, arguments)
+                return await self._call_websocket_tool(tool_name, enhanced_arguments)
             else:
-                return await self._call_http_tool(tool_name, arguments)
+                return await self._call_http_tool(tool_name, enhanced_arguments)
                 
         except Exception as e:
             logger.error(f"Failed to call tool {tool_name}: {e}")
             return {"error": f"Tool call failed: {str(e)}"}
+    
+    def _enhance_tool_arguments(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Enhance tool arguments with defaults and validation for common tools"""
+        enhanced = arguments.copy() if arguments else {}
+        
+        # Google Drive tools that commonly need instruction parameter
+        drive_tools = [
+            'google_drive-list-files',
+            'google_drive-find-file',
+            'google_drive-find-folder',
+            'google_drive-search-shared-drives',
+            'google_drive-list-access-proposals'
+        ]
+        
+        # If it's a drive tool and no instruction provided, add a sensible default
+        if tool_name in drive_tools and 'instruction' not in enhanced:
+            if tool_name == 'google_drive-list-files':
+                enhanced['instruction'] = "List all files in the root directory"
+            elif tool_name == 'google_drive-find-file':
+                enhanced['instruction'] = "Find files by name or type"
+            elif tool_name == 'google_drive-find-folder':
+                enhanced['instruction'] = "Find folders by name"
+            elif tool_name == 'google_drive-search-shared-drives':
+                enhanced['instruction'] = "List all shared drives"
+            elif tool_name == 'google_drive-list-access-proposals':
+                enhanced['instruction'] = "List pending access proposals"
+        
+        # Gmail tools that commonly need instruction parameter
+        gmail_tools = [
+            'gmail-send-email',
+            'mcp_Gmail_gmail-send-email'
+        ]
+        
+        if tool_name in gmail_tools and 'instruction' not in enhanced:
+            enhanced['instruction'] = "Send an email with the specified content"
+        
+        # YouTube tools that commonly need instruction parameter
+        youtube_tools = [
+            'youtube-search',
+            'youtube-get-video-info'
+        ]
+        
+        if tool_name in youtube_tools and 'instruction' not in enhanced:
+            enhanced['instruction'] = "Search for videos or get video information"
+        
+        logger.info(f"Enhanced arguments for {tool_name}: {enhanced}")
+        return enhanced
     
     async def _call_pipedream_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Call tool on Pipedream server with increased timeout"""
@@ -822,9 +1038,9 @@ class MCPClientDeepSeek:
                 
                 # Increased timeout configuration
                 timeout = aiohttp.ClientTimeout(
-                    connect=30.0,      # Connection timeout
-                    sock_read=self.pipedream_timeout,  # Read timeout (5 minutes)
-                    sock_connect=30.0  # Socket connect timeout
+                    connect=15.0,
+                    sock_read=self.pipedream_timeout,
+                    sock_connect=15.0
                 )
                 
                 logger.info(f"📡 [MCP DEBUG] 5. Making HTTP request to Pipedream:")
@@ -853,17 +1069,83 @@ class MCPClientDeepSeek:
                             for line in lines:
                                 if line.startswith('data: '):
                                     data_json = line[6:]
-                                    response_data = json.loads(data_json)
-                                    
-                                    # OAuth handling logic
-                                    if isinstance(response_data, dict):
-                                        if "error" in response_data and "oauth" in response_data["error"].lower():
-                                            return {"error": "OAuth authentication required", "oauth_required": True, "message": "Please authenticate with Gmail first", "details": response_data.get("error", "")}
-                                        if "oauth_url" in response_data or "auth_url" in response_data:
-                                            return {"oauth_required": True, "oauth_url": response_data.get("oauth_url") or response_data.get("auth_url"), "message": "Please click the link to authenticate with Gmail"}
-                                        if "success" in response_data and response_data.get("success"):
-                                            return {"success": True, "message": response_data.get("message", "Operation completed successfully"), "data": response_data.get("data", {})}
-                                    return response_data
+                                    try:
+                                        response_data = json.loads(data_json)
+                                        
+                                        # Check for Pipedream validation errors
+                                        if isinstance(response_data, dict) and "result" in response_data:
+                                            result = response_data["result"]
+                                            if isinstance(result, dict) and "content" in result:
+                                                content = result["content"]
+                                                if isinstance(content, list) and len(content) > 0:
+                                                    first_content = content[0]
+                                                    if isinstance(first_content, dict) and "text" in first_content:
+                                                        text = first_content["text"]
+                                                        if "Error parsing arguments" in text:
+                                                            # Extract the specific error details
+                                                            error_msg = "The tool requires specific parameters that weren't provided."
+                                                            suggestion = "Try rephrasing your request with more specific details."
+                                                            
+                                                            # Check if it's a missing instruction parameter
+                                                            if "instruction" in text and "Required" in text:
+                                                                error_msg = "The tool needs more specific instructions about what you want to do."
+                                                                suggestion = "Instead of 'list files', try 'list all files in my Google Drive' or 'show me the files in the root folder'."
+                                                            
+                                                            return {
+                                                                "error": error_msg,
+                                                                "error_type": "parameter_validation",
+                                                                "suggestion": suggestion,
+                                                                "technical_details": text,
+                                                                "enhanced_arguments": arguments
+                                                            }
+                                        
+                                        # OAuth handling logic
+                                        if isinstance(response_data, dict):
+                                            if "error" in response_data and "oauth" in response_data["error"].lower():
+                                                return {"error": "OAuth authentication required", "oauth_required": True, "message": "Please authenticate with Gmail first", "details": response_data.get("error", "")}
+                                            if "oauth_url" in response_data or "auth_url" in response_data:
+                                                return {"oauth_required": True, "oauth_url": response_data.get("oauth_url") or response_data.get("auth_url"), "message": "Please click the link to authenticate with Gmail"}
+                                            if "success" in response_data and response_data.get("success"):
+                                                return {"success": True, "message": response_data.get("message", "Operation completed successfully"), "data": response_data.get("data", {})}
+                                        
+                                        return response_data
+                                    except json.JSONDecodeError as e:
+                                        logger.error(f"Failed to parse Pipedream response JSON: {e}")
+                                        return {"error": "Invalid response format from Pipedream", "raw_response": data_json}
+                        else:
+                            # Handle regular JSON response
+                            try:
+                                response_data = await pipedream_response.json()
+                                
+                                # Check for the same validation errors in JSON responses
+                                if isinstance(response_data, dict) and "result" in response_data:
+                                    result = response_data["result"]
+                                    if isinstance(result, dict) and "content" in result:
+                                        content = result["content"]
+                                        if isinstance(content, list) and len(content) > 0:
+                                            first_content = content[0]
+                                            if isinstance(first_content, dict) and "text" in first_content:
+                                                text = first_content["text"]
+                                                if "Error parsing arguments" in text:
+                                                    error_msg = "The tool requires specific parameters that weren't provided."
+                                                    suggestion = "Try rephrasing your request with more specific details."
+                                                    
+                                                    if "instruction" in text and "Required" in text:
+                                                        error_msg = "The tool needs more specific instructions about what you want to do."
+                                                        suggestion = "Instead of 'list files', try 'list all files in my Google Drive' or 'show me the files in the root folder'."
+                                                    
+                                                    return {
+                                                        "error": error_msg,
+                                                        "error_type": "parameter_validation",
+                                                        "suggestion": suggestion,
+                                                        "technical_details": text,
+                                                        "enhanced_arguments": arguments
+                                                    }
+                                
+                                return response_data
+                            except json.JSONDecodeError as e:
+                                logger.error(f"Failed to parse Pipedream JSON response: {e}")
+                                return {"error": "Invalid JSON response from Pipedream"}
                     else:
                         return {"error": f"HTTP {pipedream_response.status}: {await pipedream_response.text()}"}
                         
