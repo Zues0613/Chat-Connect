@@ -1,6 +1,6 @@
 from pydantic import BaseModel, EmailStr
 from prisma import Prisma
-from fastapi import APIRouter, HTTPException, Depends, status, Request, Query
+from fastapi import APIRouter, HTTPException, Depends, status, Request, Query, Response
 from fastapi.security import OAuth2PasswordBearer
 from fastapi.responses import RedirectResponse
 from app.auth.models import SendOTPRequest, VerifyOTPRequest, TokenResponse, MeResponse
@@ -50,52 +50,65 @@ async def register_user(data: RegisterRequest):
 
 
 @router.post("/send-otp")
-def send_otp(data: SendOTPRequest):
-    # For test email, don't actually send email
-    if data.email == "test@gmail.com":
-        print(f"[DEBUG] Test email detected: {data.email}, skipping actual email send")
-        return {"message": "OTP sent to email (test mode)."}
-    
-    otp = otp_manager.generate_otp(data.email)
-    send_email(data.email, otp)
-    return {"message": "OTP sent to email."}
+async def send_otp(data: SendOTPRequest):
+    print(f"[DEBUG] Send OTP request for email: {data.email}, purpose: {data.purpose}")
+
+    # Check if user exists in database before sending OTP
+    try:
+        prisma = Prisma()
+        await prisma.connect()
+
+        existing_user = await prisma.user.find_unique(where={"email": data.email})
+        await prisma.disconnect()
+
+        # For registration, user should NOT exist
+        if data.purpose == "register":
+            if existing_user:
+                print(f"[DEBUG] User already exists for registration: {data.email}")
+                raise HTTPException(status_code=400, detail="Email already registered.")
+            print(f"[DEBUG] User not found for registration, proceeding to send OTP: {data.email}")
+
+        # For login, user MUST exist
+        elif data.purpose == "login":
+            if not existing_user:
+                print(f"[DEBUG] User not found for login: {data.email}")
+                raise HTTPException(status_code=404, detail="No user found with this email. Please register first.")
+            print(f"[DEBUG] User found for login, proceeding to send OTP: {data.email}")
+
+        # For test email, don't actually send email
+        if data.email == "test@gmail.com":
+            print(f"[DEBUG] Test email detected: {data.email}, skipping actual email send")
+            return {"message": "OTP sent to email (test mode)."}
+
+        otp = otp_manager.generate_otp(data.email)
+        send_email(data.email, otp)
+        return {"message": "OTP sent to email."}
+
+    except HTTPException:
+        raise
+    except Exception as db_error:
+        print(f"[DEBUG] Database error during send OTP for {data.email}: {str(db_error)}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(db_error)}")
 
 @router.post("/verify-otp", response_model=TokenResponse)
 async def verify_otp(data: VerifyOTPRequest):
+    print(f"[DEBUG] Starting OTP verification for email: {data.email}")
+    print(f"[DEBUG] OTP provided: {data.otp}")
+
     if not otp_manager.verify_otp(data.email, data.otp):
+        print(f"[DEBUG] OTP verification failed for {data.email}")
         raise HTTPException(status_code=400, detail="Invalid or expired OTP.")
-    
-    # Ensure user exists in database (especially for test email)
-    prisma = Prisma()
-    await prisma.connect()
-    
-    # Check if user exists
-    existing_user = await prisma.user.find_unique(where={"email": data.email})
-    
-    if not existing_user:
-        # Create user if they don't exist (especially for test email)
-        if data.email == "test@gmail.com":
-            user = await prisma.user.create(
-                data={
-                    "name": "Test Admin",
-                    "email": data.email,
-                }
-            )
-            print(f"[DEBUG] Created test user: {user.name} ({user.email})")
-        else:
-            await prisma.disconnect()
-            raise HTTPException(status_code=400, detail="User not found. Please register first.")
-    else:
-        print(f"[DEBUG] User found: {existing_user.name} ({existing_user.email})")
-    
-    await prisma.disconnect()
-    
+
+    print(f"[DEBUG] OTP verification passed for {data.email}")
+
+    # At this point, user existence has already been validated during send-otp
+    # We just need to generate the token
     token = create_access_token({"sub": data.email})
     print(f"[DEBUG] Generated token for {data.email}: {token[:20]}...")
     return TokenResponse(access_token=token)
 
 @router.get("/me", response_model=MeResponse)
-async def get_me(token: str = Depends(oauth2_scheme)):
+async def get_me(request: Request, response: Response, token: str = Depends(oauth2_scheme)):
     try:
         print(f"[DEBUG] /auth/me called with token: {token[:20]}..." if token else "[DEBUG] /auth/me called with no token")
         payload = decode_access_token(token)
@@ -118,6 +131,33 @@ async def get_me(token: str = Depends(oauth2_scheme)):
         
         await prisma.disconnect()
         
+        # Conditional caching headers (ETag + Last-Modified)
+        try:
+            latest_updated = int(user.updatedAt.timestamp()) if getattr(user, 'updatedAt', None) else 0
+        except Exception:
+            latest_updated = 0
+        etag_value = f'W/"me:{user.id}:{latest_updated}"'
+        if_none_match = request.headers.get("if-none-match")
+        if if_none_match == etag_value:
+            return Response(status_code=304)
+
+        if_modified_since = request.headers.get("if-modified-since")
+        if latest_updated and if_modified_since:
+            from email.utils import parsedate_to_datetime
+            try:
+                ims_dt = parsedate_to_datetime(if_modified_since)
+                if int(ims_dt.timestamp()) >= latest_updated:
+                    return Response(status_code=304)
+            except Exception:
+                pass
+
+        from wsgiref.handlers import format_date_time
+        response.headers["ETag"] = etag_value
+        response.headers["Cache-Control"] = "private, max-age=60, must-revalidate"
+        response.headers["Vary"] = "Authorization"
+        if latest_updated:
+            response.headers["Last-Modified"] = format_date_time(latest_updated)
+
         print(f"[DEBUG] User found: {user.name} ({user.email})")
         return MeResponse(email=user.email, name=user.name)
         

@@ -1,6 +1,8 @@
-from fastapi import APIRouter, HTTPException, Depends, status
+from fastapi import APIRouter, HTTPException, Depends, status, Request, Response
 from fastapi.security import OAuth2PasswordBearer
 from fastapi.responses import StreamingResponse
+from email.utils import parsedate_to_datetime
+from wsgiref.handlers import format_date_time
 from pydantic import BaseModel
 from prisma import Prisma
 from typing import List, Dict, Any, Optional
@@ -302,7 +304,7 @@ Return only the title, nothing else."""
         return "New Chat"
 
 @router.get("/chats")
-async def list_chats(token: str = Depends(oauth2_scheme)):
+async def list_chats(request: Request, response: Response, token: str = Depends(oauth2_scheme)):
     """Get all chat sessions for the user"""
     try:
         payload = decode_access_token(token)
@@ -328,6 +330,32 @@ async def list_chats(token: str = Depends(oauth2_scheme)):
         
         await prisma.disconnect()
         
+        # Build a stable ETag based on user + count + most recent updatedAt
+        try:
+            latest_updated = int(chats[0].updatedAt.timestamp()) if chats else 0
+        except Exception:
+            latest_updated = 0
+        etag_value = f'W/"chats:{user.id}:{len(chats)}:{latest_updated}"'
+        if_none_match = request.headers.get("if-none-match")
+        if if_none_match == etag_value:
+            return Response(status_code=304)
+
+        # Last-Modified handling
+        if_modified_since = request.headers.get("if-modified-since")
+        if latest_updated and if_modified_since:
+            try:
+                ims_dt = parsedate_to_datetime(if_modified_since)
+                if int(ims_dt.timestamp()) >= latest_updated:
+                    return Response(status_code=304)
+            except Exception:
+                pass
+
+        response.headers["ETag"] = etag_value
+        response.headers["Cache-Control"] = "private, max-age=60, must-revalidate"
+        response.headers["Vary"] = "Authorization"
+        if latest_updated:
+            response.headers["Last-Modified"] = format_date_time(latest_updated)
+
         return [
             ChatResponse(
                 id=chat.id,
@@ -346,6 +374,8 @@ async def list_chats(token: str = Depends(oauth2_scheme)):
 @router.get("/chats/{chat_id}/messages")
 async def get_chat_messages(
     chat_id: int,
+    request: Request,
+    response: Response,
     token: str = Depends(oauth2_scheme)
 ):
     """Get all messages for a specific chat"""
@@ -392,6 +422,32 @@ async def get_chat_messages(
         await prisma.disconnect()
         print(f"[DEBUG] Disconnected from database")
         
+        # Compute ETag for this chat's messages (count + last createdAt)
+        try:
+            last_ts = int(sorted_messages[-1].createdAt.timestamp()) if sorted_messages else 0
+        except Exception:
+            last_ts = 0
+        etag_value = f'W/"msgs:{chat_id}:{len(sorted_messages)}:{last_ts}"'
+        if_none_match = request.headers.get("if-none-match")
+        if if_none_match == etag_value:
+            return Response(status_code=304)
+
+        # Last-Modified handling
+        if_modified_since = request.headers.get("if-modified-since")
+        if last_ts and if_modified_since:
+            try:
+                ims_dt = parsedate_to_datetime(if_modified_since)
+                if int(ims_dt.timestamp()) >= last_ts:
+                    return Response(status_code=304)
+            except Exception:
+                pass
+
+        response.headers["ETag"] = etag_value
+        response.headers["Cache-Control"] = "private, max-age=60, must-revalidate"
+        response.headers["Vary"] = "Authorization"
+        if last_ts:
+            response.headers["Last-Modified"] = format_date_time(last_ts)
+
         result = [
             MessageResponse(
                 id=msg.id,
@@ -479,6 +535,8 @@ async def get_chat_by_hash(
 @router.get("/chats/hash/{chat_hash}/messages")
 async def get_chat_messages_by_hash(
     chat_hash: str,
+    request: Request,
+    response: Response,
     token: str = Depends(oauth2_scheme)
 ):
     """Get messages for a chat by hash"""
@@ -525,6 +583,32 @@ async def get_chat_messages_by_hash(
         await prisma.disconnect()
         print(f"[DEBUG] Disconnected from database")
         
+        # Compute ETag for this chat hash messages
+        try:
+            last_ts = int(sorted_messages[-1].createdAt.timestamp()) if sorted_messages else 0
+        except Exception:
+            last_ts = 0
+        etag_value = f'W/"msgs_hash:{chat_hash}:{len(sorted_messages)}:{last_ts}"'
+        if_none_match = request.headers.get("if-none-match")
+        if if_none_match == etag_value:
+            return Response(status_code=304)
+
+        # Last-Modified handling
+        if_modified_since = request.headers.get("if-modified-since")
+        if last_ts and if_modified_since:
+            try:
+                ims_dt = parsedate_to_datetime(if_modified_since)
+                if int(ims_dt.timestamp()) >= last_ts:
+                    return Response(status_code=304)
+            except Exception:
+                pass
+
+        response.headers["ETag"] = etag_value
+        response.headers["Cache-Control"] = "private, max-age=60, must-revalidate"
+        response.headers["Vary"] = "Authorization"
+        if last_ts:
+            response.headers["Last-Modified"] = format_date_time(last_ts)
+
         result = [
             MessageResponse(
                 id=msg.id,
@@ -910,6 +994,15 @@ async def send_message(
         # No intent detected or no MCP servers - proceed with regular chat
         # Quick guard: Provide built-in MCP setup help for generic setup questions
         if _is_mcp_setup_query(request.content):
+            # Store the user's setup question first
+            user_message = await prisma.message.create(
+                data={
+                    "chatSessionId": chat_id,
+                    "content": request.content,
+                    "role": "user"
+                }
+            )
+            # Then store the assistant's setup guidance
             setup_msg = await prisma.message.create(
                 data={
                     "chatSessionId": chat_id,

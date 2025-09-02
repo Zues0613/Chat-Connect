@@ -22,31 +22,40 @@ class OTPManager:
         return otp
 
     def verify_otp(self, email: str, otp: str) -> bool:
+        # Clean the input OTP to remove any non-numeric characters
+        otp = ''.join(filter(str.isdigit, str(otp))).strip()
+
         # Special bypass for test email
         if email == self.test_email:
             print(f"[DEBUG] Test email verification: {email}")
+            print(f"[DEBUG] Cleaned OTP: '{otp}'")
             if otp == self.test_otp:
                 print("[DEBUG] Test email OTP verified successfully")
                 return True
             else:
-                print(f"[DEBUG] Test email OTP mismatch: expected {self.test_otp}, got {otp}")
+                print(f"[DEBUG] Test email OTP mismatch: expected '{self.test_otp}', got '{otp}'")
                 return False
-        
+
         # Normal OTP verification for other emails
         entry = self.otp_store.get(email)
         print(f"[DEBUG] Verifying OTP for email: {email}")
-        print(f"[DEBUG] Provided OTP: {otp}")
+        print(f"[DEBUG] Provided OTP (cleaned): '{otp}'")
         print(f"[DEBUG] Stored entry: {entry}")
+
         if not entry:
             print("[DEBUG] No OTP entry found for this email.")
             return False
+
         if time.time() > entry["expires_at"]:
             print("[DEBUG] OTP expired.")
             self.otp_store.pop(email, None)
             return False
-        if entry["otp"] == otp:
+
+        stored_otp = str(entry["otp"]).strip()
+        if stored_otp == otp:
             print("[DEBUG] OTP matched. Verification successful.")
             self.otp_store.pop(email, None)
             return True
-        print("[DEBUG] OTP did not match.")
+
+        print(f"[DEBUG] OTP did not match. Stored: '{stored_otp}', Provided: '{otp}'")
         return False
