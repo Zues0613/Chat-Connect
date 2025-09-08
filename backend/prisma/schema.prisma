@@ -1,0 +1,112 @@
+generator client {
+  provider = "prisma-client-py"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id             Int           @id @default(autoincrement())
+  email          String        @unique
+  googleId       String?       @unique
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  lastLogin      DateTime?
+  name           String
+  preferredModel String?       @default("gemini")
+  apiKeys        APIKey[]
+  chats          ChatSession[]
+  servers        MCPServer[]
+  sessions       Session[]
+  oauthStates    OAuthState[]
+  oauthTokens    OAuthToken[]
+}
+
+model Session {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  jwtToken  String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id])
+}
+
+model ChatSession {
+  id        Int       @id @default(autoincrement())
+  userId    Int
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  title     String?   @default("New Chat")
+  hash      String?   @unique // Optional hash for URL (will be populated)
+  user      User      @relation(fields: [userId], references: [id])
+  messages  Message[]
+}
+
+model Message {
+  id            Int         @id @default(autoincrement())
+  chatSessionId Int
+  content       String
+  role          MessageRole
+  createdAt     DateTime    @default(now())
+  chatSession   ChatSession @relation(fields: [chatSessionId], references: [id])
+}
+
+model MCPServer {
+  id          Int      @id @default(autoincrement())
+  userId      Int
+  name        String   @db.VarChar(100)
+  description String?  @db.VarChar(255)
+  config      Json
+  createdAt   DateTime @default(now())
+  user        User     @relation(fields: [userId], references: [id])
+  oauthStates OAuthState[]
+  oauthTokens OAuthToken[]
+}
+
+model APIKey {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  name      String   @db.VarChar(100)
+  provider  String   @db.VarChar(50)
+  value     String
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id])
+}
+
+model OAuthState {
+  id           String    @id @default(cuid())
+  user         User      @relation(fields: [userId], references: [id])
+  userId       Int
+  server       MCPServer @relation(fields: [serverId], references: [id])
+  serverId     Int
+  state        String    @unique // OAuth state parameter for security
+  provider     String    @db.VarChar(50) // e.g., "gmail", "google", "github"
+  redirectUri  String    @db.Text
+  expiresAt    DateTime
+  createdAt    DateTime  @default(now())
+}
+
+model OAuthToken {
+  id           Int       @id @default(autoincrement())
+  user         User      @relation(fields: [userId], references: [id])
+  userId       Int
+  server       MCPServer @relation(fields: [serverId], references: [id])
+  serverId     Int
+  provider     String    @db.VarChar(50)
+  accessToken  String    @db.Text
+  refreshToken String?   @db.Text
+  tokenType    String    @default("Bearer")
+  expiresAt    DateTime?
+  scope        String?   @db.Text
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@unique([userId, serverId, provider])
+}
+
+enum MessageRole {
+  user
+  assistant
+}

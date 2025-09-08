@@ -1,0 +1,17 @@
+fastapi
+uvicorn
+prisma
+pydantic
+python-jose[cryptography]
+passlib[bcrypt]
+python-multipart
+python-dotenv
+openai
+aiohttp
+websockets
+pydantic-settings
+langchain
+langchain-core
+langchain-google-genai
+langchain-mcp-adapters
+langgraph 
